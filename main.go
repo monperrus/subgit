@@ -50,7 +50,7 @@ type repoStatus struct {
 func main() {
 	configPath := os.Getenv("SUBGIT_CONFIG")
 	if configPath == "" {
-		configPath = "/data/config.json"
+		configPath = "/etc/subgit/config.json"
 	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {

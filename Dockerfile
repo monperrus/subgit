@@ -6,7 +6,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -trimpath -ldflags
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git git-filter-repo ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/subgit /usr/local/bin/subgit
-COPY config.example.json /data/config.json
+COPY config.example.json /etc/subgit/config.json
 VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/subgit"]
