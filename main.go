@@ -61,10 +61,14 @@ func main() {
 		if err := validateRepository(repo); err != nil {
 			log.Fatal(err)
 		}
-		if err := s.sync(repo); err != nil {
-			log.Printf("initial sync of %s failed: %v", repo.Name, err)
-		}
 	}
+	go func() {
+		for _, repo := range cfg.Repositories {
+			if err := s.sync(repo); err != nil {
+				log.Printf("initial sync of %s failed: %v", repo.Name, err)
+			}
+		}
+	}()
 	go s.refreshLoop()
 	http.HandleFunc("/status", s.handleStatus)
 	http.HandleFunc("/", s.handleGit)
