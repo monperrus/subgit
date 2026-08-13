@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,7 +138,7 @@ func (s *Server) sync(r Repository) error {
 	if err := run(context.Background(), "git", "-C", tmp, "filter-repo", "--force", "--refs", "refs/heads/"+r.Ref, "--path", prefix, "--path-rename", prefix+":"); err != nil {
 		return fmt.Errorf("filter history: %w", err)
 	}
-	if err := run(context.Background(), "git", "-C", tmp, "config", "http.receivepack", "false"); err != nil {
+	if err := run(context.Background(), "git", "-C", tmp, "config", "http.receivepack", "true"); err != nil {
 		return err
 	}
 
@@ -217,6 +218,67 @@ func run(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+func runOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	b, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func (s *Server) writeThrough(ctx context.Context, r Repository, token string) error {
+	root := filepath.Join(s.config.DataDir, "repositories")
+	virtual := filepath.Join(root, r.Name+".git")
+	head, err := runOutput(ctx, "git", "-C", virtual, "rev-parse", "refs/heads/"+r.Ref)
+	if err != nil {
+		return fmt.Errorf("read pushed head: %w", err)
+	}
+	work, err := os.MkdirTemp(root, "write-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	// The token is passed only to Git's HTTPS credential parser, never logged.
+	upstream := "https://x-access-token:" + url.QueryEscape(token) + "@github.com/" + strings.TrimPrefix(strings.TrimSuffix(r.Upstream, ".git"), "https://github.com/") + ".git"
+	if err := run(ctx, "git", "clone", "--depth=1", "--branch", r.Ref, upstream, work); err != nil {
+		return fmt.Errorf("clone upstream for write: %w", err)
+	}
+	destination := filepath.Join(work, filepath.FromSlash(r.Path))
+	if err := os.RemoveAll(destination); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destination, 0755); err != nil {
+		return err
+	}
+	archive := exec.CommandContext(ctx, "git", "-C", virtual, "archive", strings.TrimSpace(string(head)))
+	tar := exec.CommandContext(ctx, "tar", "-x", "-C", destination)
+	pipe, err := archive.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	tar.Stdin = pipe
+	if err := tar.Start(); err != nil {
+		return err
+	}
+	if err := archive.Run(); err != nil {
+		return err
+	}
+	if err := tar.Wait(); err != nil {
+		return err
+	}
+	if err := run(ctx, "git", "-C", work, "add", "--", r.Path); err != nil {
+		return err
+	}
+	if err := run(ctx, "git", "-C", work, "-c", "user.name=subgit", "-c", "user.email=subgit@localhost", "commit", "-m", "Update "+r.Path+" via subgit"); err != nil {
+		return fmt.Errorf("commit upstream projection: %w", err)
+	}
+	if err := run(ctx, "git", "-C", work, "push", "origin", "HEAD:refs/heads/"+r.Ref); err != nil {
+		return fmt.Errorf("push upstream projection: %w", err)
+	}
+	return s.sync(r)
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	out := map[string]repoStatus{}
 	s.status.Range(func(key, value any) bool { out[key.(string)] = value.(repoStatus); return true })
@@ -234,9 +296,16 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if strings.Contains(r.URL.Path, "git-receive-pack") {
-		http.Error(w, "subgit is read-only", http.StatusForbidden)
-		return
+	isPush := strings.Contains(r.URL.Path, "git-receive-pack")
+	var token string
+	if isPush {
+		var ok bool
+		token, ok = s.oauth.token(r)
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="subgit GitHub OAuth session"`)
+			http.Error(w, "authorize at /auth/github first", http.StatusUnauthorized)
+			return
+		}
 	}
 	if err := s.ensure(virtual, id); err != nil {
 		http.Error(w, "materializing virtual repository: "+err.Error(), http.StatusBadGateway)
@@ -259,6 +328,13 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCGI(w, out.Bytes())
+	if isPush {
+		go func() {
+			if err := s.writeThrough(context.Background(), virtual, token); err != nil {
+				log.Printf("write-through %s: %v", id, err)
+			}
+		}()
+	}
 }
 
 func writeCGI(w http.ResponseWriter, response []byte) {
