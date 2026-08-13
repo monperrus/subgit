@@ -54,8 +54,8 @@ git add . && git commit -m "Update selected folder" && git push
 ## Operational limits
 
 - Only public GitHub repositories and their `main` branch are currently supported.
-- A virtual push is acknowledged before its asynchronous upstream projection completes. Check service logs/status when operating this in production.
-- The service projects the complete virtual tree into the selected directory; it does not yet preserve the original commit author/message upstream.
+- A virtual push succeeds only after its upstream projection succeeds. If GitHub rejects the projection—for example because the upstream branch moved—the virtual branch is rolled back and Git reports a conflict.
+- The service projects the complete virtual tree into the selected directory and preserves the virtual commit's author and message in the upstream commit.
 - OAuth sessions are held in memory, so a service restart requires users to authorize again.
 - Run this behind TLS. The callback-provided temporary password is stored in the Git remote's push URL.
 

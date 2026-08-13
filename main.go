@@ -270,7 +270,19 @@ func (s *Server) writeThrough(ctx context.Context, r Repository, token string) e
 	if err := run(ctx, "git", "-C", work, "add", "--", r.Path); err != nil {
 		return err
 	}
-	if err := run(ctx, "git", "-C", work, "-c", "user.name=subgit", "-c", "user.email=subgit@localhost", "commit", "-m", "Update "+r.Path+" via subgit"); err != nil {
+	message, err := runOutput(ctx, "git", "-C", virtual, "log", "-1", "--format=%B", strings.TrimSpace(string(head)))
+	if err != nil {
+		return fmt.Errorf("read pushed commit message: %w", err)
+	}
+	author, err := runOutput(ctx, "git", "-C", virtual, "log", "-1", "--format=%an <%ae>", strings.TrimSpace(string(head)))
+	if err != nil {
+		return fmt.Errorf("read pushed commit author: %w", err)
+	}
+	messageFile := filepath.Join(work, ".subgit-message")
+	if err := os.WriteFile(messageFile, message, 0600); err != nil {
+		return err
+	}
+	if err := run(ctx, "git", "-C", work, "-c", "user.name=subgit", "-c", "user.email=subgit@localhost", "commit", "--allow-empty", "--author="+strings.TrimSpace(string(author)), "-F", messageFile); err != nil {
 		return fmt.Errorf("commit upstream projection: %w", err)
 	}
 	if err := run(ctx, "git", "-C", work, "push", "origin", "HEAD:refs/heads/"+r.Ref); err != nil {
@@ -298,6 +310,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	}
 	isPush := strings.Contains(r.URL.Path, "git-receive-pack")
 	var token string
+	var oldHead string
 	if isPush {
 		var ok bool
 		token, ok = s.oauth.token(r)
@@ -305,6 +318,9 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="subgit GitHub OAuth session"`)
 			http.Error(w, "authorize at /auth/github first", http.StatusUnauthorized)
 			return
+		}
+		if previous, err := runOutput(r.Context(), "git", "-C", filepath.Join(s.config.DataDir, "repositories", virtual.Name+".git"), "rev-parse", "refs/heads/"+virtual.Ref); err == nil {
+			oldHead = strings.TrimSpace(string(previous))
 		}
 	}
 	if err := s.ensure(virtual, id); err != nil {
@@ -327,14 +343,17 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "git backend: "+strings.TrimSpace(stderr.String()), http.StatusBadGateway)
 		return
 	}
-	writeCGI(w, out.Bytes())
 	if isPush {
-		go func() {
-			if err := s.writeThrough(context.Background(), virtual, token); err != nil {
-				log.Printf("write-through %s: %v", id, err)
+		if err := s.writeThrough(r.Context(), virtual, token); err != nil {
+			if oldHead != "" {
+				_ = run(context.Background(), "git", "-C", filepath.Join(s.config.DataDir, "repositories", virtual.Name+".git"), "update-ref", "refs/heads/"+virtual.Ref, oldHead)
 			}
-		}()
+			log.Printf("write-through %s: %v", id, err)
+			http.Error(w, "upstream projection failed; virtual push was rolled back: "+err.Error(), http.StatusConflict)
+			return
+		}
 	}
+	writeCGI(w, out.Bytes())
 }
 
 func writeCGI(w http.ResponseWriter, response []byte) {
