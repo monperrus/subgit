@@ -63,8 +63,11 @@ func (o *OAuth) begin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "return_to must be a local virtual-repository path", http.StatusBadRequest)
 		return
 	}
-	if _, _, _, err := repositoryForURL(returnTo); err != nil {
-		http.Error(w, "invalid return_to: "+err.Error(), http.StatusBadRequest)
+	// Validate only traversal here. The Git smart-HTTP handler performs the
+	// authoritative identifier parsing; keeping this tolerant avoids URL-path
+	// normalization differences between browser and Git clients.
+	if strings.Contains(returnTo, "..") || !strings.HasSuffix(returnTo, ".git") {
+		http.Error(w, "return_to must name a virtual .git repository", http.StatusBadRequest)
 		return
 	}
 	state, err := randomID()
