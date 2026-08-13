@@ -1,13 +1,5 @@
 {
   "listen": ":8080",
   "data_dir": "/data",
-  "refresh_interval": "15m",
-  "repositories": [
-    {
-      "name": "paper",
-      "upstream": "https://github.com/labri-progress/what-are-they-doing.git",
-      "ref": "main",
-      "path": "paper"
-    }
-  ]
+  "refresh_interval": "15m"
 }

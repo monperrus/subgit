@@ -1,12 +1,13 @@
 # subgit
 
-`subgit` exposes a directory in a monorepo as a normal, read-only Git smart-HTTP repository. It builds a filtered bare repository, so clients use ordinary Git commands:
+`subgit` exposes any public GitHub directory as a normal, read-only Git smart-HTTP repository. It builds a filtered bare repository, so clients use ordinary Git commands. The URL contains one identifier: `OWNER/REPOSITORY/FOLDER`.
 
 ```sh
-git clone https://HOST/paper.git
+git clone https://HOST/labri-progress/what-are-they-doing/paper.git
+git clone https://HOST/monperrus/test-repo-public/.github.git
 ```
 
-Copy `config.example.json` to a persistent data directory and run `subgit`. Each configured repository is refreshed periodically. The virtual history contains commits that affect its configured path, with that path removed from the checkout root.
+Copy `config.example.json` to a persistent data directory and run `subgit`. Requested GitHub directories are cached and refreshed periodically. The virtual history contains commits that affect the requested path, with that path removed from the checkout root.
 
 ## Local run
 

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,10 +24,9 @@ import (
 )
 
 type Config struct {
-	Listen          string       `json:"listen"`
-	DataDir         string       `json:"data_dir"`
-	RefreshInterval string       `json:"refresh_interval"`
-	Repositories    []Repository `json:"repositories"`
+	Listen          string `json:"listen"`
+	DataDir         string `json:"data_dir"`
+	RefreshInterval string `json:"refresh_interval"`
 }
 
 type Repository struct {
@@ -39,6 +39,7 @@ type Repository struct {
 type Server struct {
 	config Config
 	mu     sync.RWMutex // excludes git-http-backend while a repo directory is replaced
+	build  sync.Mutex   // avoids concurrent materialization of the same virtual repo
 	status sync.Map
 }
 
@@ -57,19 +58,6 @@ func main() {
 		log.Fatal(err)
 	}
 	s := &Server{config: cfg}
-	for _, repo := range cfg.Repositories {
-		if err := validateRepository(repo); err != nil {
-			log.Fatal(err)
-		}
-	}
-	go func() {
-		for _, repo := range cfg.Repositories {
-			if err := s.sync(repo); err != nil {
-				log.Printf("initial sync of %s failed: %v", repo.Name, err)
-			}
-		}
-	}()
-	go s.refreshLoop()
 	http.HandleFunc("/status", s.handleStatus)
 	http.HandleFunc("/", s.handleGit)
 	log.Printf("subgit listening on %s", cfg.Listen)
@@ -93,9 +81,6 @@ func loadConfig(path string) (Config, error) {
 	}
 	// Convenient for local testing and single-repository deployments; the
 	// checked-in config remains safe to use unchanged in production.
-	if upstream := os.Getenv("SUBGIT_UPSTREAM"); upstream != "" && len(cfg.Repositories) == 1 {
-		cfg.Repositories[0].Upstream = upstream
-	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/data"
 	}
@@ -104,9 +89,6 @@ func loadConfig(path string) (Config, error) {
 	}
 	if _, err := time.ParseDuration(cfg.RefreshInterval); err != nil {
 		return Config{}, fmt.Errorf("invalid refresh_interval: %w", err)
-	}
-	if len(cfg.Repositories) == 0 {
-		return Config{}, errors.New("config has no repositories")
 	}
 	return cfg, os.MkdirAll(cfg.DataDir, 0755)
 }
@@ -119,17 +101,6 @@ func validateRepository(r Repository) error {
 		return fmt.Errorf("repository %q needs a ref", r.Name)
 	}
 	return nil
-}
-
-func (s *Server) refreshLoop() {
-	d, _ := time.ParseDuration(s.config.RefreshInterval)
-	for range time.NewTicker(d).C {
-		for _, repo := range s.config.Repositories {
-			if err := s.sync(repo); err != nil {
-				log.Printf("sync %s: %v", repo.Name, err)
-			}
-		}
-	}
 }
 
 func (s *Server) sync(r Repository) error {
@@ -182,8 +153,54 @@ func (s *Server) sync(r Repository) error {
 		return err
 	}
 	_ = os.RemoveAll(old)
-	s.status.Store(r.Name, repoStatus{LastSync: time.Now().UTC()})
 	log.Printf("synced %s from %s:%s", r.Name, r.Upstream, r.Path)
+	return nil
+}
+
+// repositoryForURL translates one public identifier into an internal safe
+// cache name. Identifiers always name a public GitHub owner/repository/path.
+func repositoryForURL(path string) (Repository, string, string, error) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	gitAt := -1
+	for i, part := range parts {
+		if strings.HasSuffix(part, ".git") {
+			gitAt = i
+			break
+		}
+	}
+	if gitAt < 2 {
+		return Repository{}, "", "", errors.New("expected /OWNER/REPOSITORY/FOLDER.git")
+	}
+	identifier := append([]string(nil), parts[:gitAt+1]...)
+	identifier[gitAt] = strings.TrimSuffix(identifier[gitAt], ".git")
+	for _, part := range identifier {
+		if part == "" || part == "." || part == ".." || strings.ContainsAny(part, "\\?&#%") {
+			return Repository{}, "", "", errors.New("invalid GitHub repository identifier")
+		}
+	}
+	key := strings.Join(identifier, "/")
+	if len(identifier) < 3 {
+		return Repository{}, "", "", errors.New("a folder is required")
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))[:20]
+	return Repository{Name: digest, Upstream: "https://github.com/" + identifier[0] + "/" + identifier[1] + ".git", Ref: "main", Path: strings.Join(identifier[2:], "/")}, key, strings.Join(parts[gitAt+1:], "/"), nil
+}
+
+func (s *Server) ensure(r Repository, id string) error {
+	if v, ok := s.status.Load(id); ok {
+		status := v.(repoStatus)
+		d, _ := time.ParseDuration(s.config.RefreshInterval)
+		if status.Error == "" && time.Since(status.LastSync) < d {
+			return nil
+		}
+	}
+	s.build.Lock()
+	defer s.build.Unlock()
+	if err := s.sync(r); err != nil {
+		s.status.Store(id, repoStatus{Error: err.Error()})
+		return err
+	}
+	s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
 	return nil
 }
 
@@ -199,11 +216,7 @@ func run(ctx context.Context, name string, args ...string) error {
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	out := map[string]repoStatus{}
-	for _, r := range s.config.Repositories {
-		if v, ok := s.status.Load(r.Name); ok {
-			out[r.Name] = v.(repoStatus)
-		}
-	}
+	s.status.Range(func(key, value any) bool { out[key.(string)] = value.(repoStatus); return true })
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
@@ -213,18 +226,17 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	if len(parts) < 2 || !strings.HasSuffix(parts[0], ".git") {
-		http.NotFound(w, r)
-		return
-	}
-	name := strings.TrimSuffix(parts[0], ".git")
-	if !s.hasRepository(name) {
-		http.NotFound(w, r)
+	virtual, id, suffix, err := repositoryForURL(r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if strings.Contains(r.URL.Path, "git-receive-pack") {
 		http.Error(w, "subgit is read-only", http.StatusForbidden)
+		return
+	}
+	if err := s.ensure(virtual, id); err != nil {
+		http.Error(w, "materializing virtual repository: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -234,7 +246,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	cmd.Stdin = r.Body
 	cmd.Env = append(os.Environ(),
 		"GIT_PROJECT_ROOT="+filepath.Join(s.config.DataDir, "repositories"), "GIT_HTTP_EXPORT_ALL=1",
-		"REQUEST_METHOD="+r.Method, "PATH_INFO="+r.URL.Path, "QUERY_STRING="+r.URL.RawQuery,
+		"REQUEST_METHOD="+r.Method, "PATH_INFO=/"+virtual.Name+".git/"+suffix, "QUERY_STRING="+r.URL.RawQuery,
 		"CONTENT_TYPE="+r.Header.Get("Content-Type"), "CONTENT_LENGTH="+r.Header.Get("Content-Length"),
 		"REMOTE_ADDR="+r.RemoteAddr, "HTTP_GIT_PROTOCOL="+r.Header.Get("Git-Protocol"))
 	var out, stderr bytes.Buffer
@@ -244,15 +256,6 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCGI(w, out.Bytes())
-}
-
-func (s *Server) hasRepository(name string) bool {
-	for _, r := range s.config.Repositories {
-		if r.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 func writeCGI(w http.ResponseWriter, response []byte) {
