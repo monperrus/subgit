@@ -38,6 +38,7 @@ type Repository struct {
 
 type Server struct {
 	config Config
+	oauth  *OAuth
 	mu     sync.RWMutex // excludes git-http-backend while a repo directory is replaced
 	build  sync.Mutex   // avoids concurrent materialization of the same virtual repo
 	status sync.Map
@@ -57,8 +58,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &Server{config: cfg}
+	s := &Server{config: cfg, oauth: newOAuth()}
 	http.HandleFunc("/status", s.handleStatus)
+	http.HandleFunc("/auth/github", s.oauth.begin)
+	http.HandleFunc("/auth/github/callback", s.oauth.callback)
 	http.HandleFunc("/", s.handleGit)
 	log.Printf("subgit listening on %s", cfg.Listen)
 	log.Fatal(http.ListenAndServe(cfg.Listen, nil))

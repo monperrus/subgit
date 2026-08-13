@@ -20,6 +20,16 @@ git clone http://localhost:8080/paper.git
 
 `GET /status` reports the most recent successful materialization. Pushes are deliberately rejected in this MVP.
 
+## GitHub OAuth App setup
+
+Register a GitHub OAuth App with callback URL `https://HOST/auth/github/callback`, then provide `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and `SUBGIT_PUBLIC_URL=https://HOST` as service environment variables. Users begin authorization at:
+
+```text
+https://HOST/auth/github?return_to=/OWNER/REPOSITORY/FOLDER.git
+```
+
+The callback creates an eight-hour opaque Git HTTPS password. Write-through handling uses that password to identify the user without persisting their GitHub access token; the repository-write transport is the next integration point.
+
 ## Container deployment
 
 ```sh
