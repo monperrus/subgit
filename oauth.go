@@ -78,7 +78,7 @@ func (o *OAuth) begin(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	o.states[state] = oauthState{returnTo: returnTo, expires: time.Now().Add(10 * time.Minute)}
 	o.mu.Unlock()
-	v := url.Values{"client_id": {o.clientID}, "redirect_uri": {o.publicURL + "/auth/github/callback"}, "scope": {"repo"}, "state": {state}}
+	v := url.Values{"client_id": {o.clientID}, "redirect_uri": {o.publicURL + "/auth/github/callback"}, "scope": {"repo workflow"}, "state": {state}}
 	http.Redirect(w, r, "https://github.com/login/oauth/authorize?"+v.Encode(), http.StatusFound)
 }
 
