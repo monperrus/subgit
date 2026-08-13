@@ -2,10 +2,22 @@
 
 `subgit` exposes a directory inside a public GitHub repository as a normal Git repository. It materializes filtered Git history, so ordinary Git clients see the selected directory as their checkout root. The URL contains one identifier: `OWNER/REPOSITORY/FOLDER`.
 
+## Hosted service
+
+The reference deployment is available at **https://subgit.gakoy.com**. Clone a directory directly by replacing `OWNER/REPOSITORY/FOLDER`:
+
 ```sh
-git clone https://HOST/labri-progress/what-are-they-doing/paper.git
-git clone https://HOST/monperrus/test-repo-public/.github.git
+git clone https://subgit.gakoy.com/labri-progress/what-are-they-doing/paper.git
+git clone https://subgit.gakoy.com/monperrus/test-repo-public/.github.git
 ```
+
+For an OAuth-authorized write-through push, visit:
+
+```text
+https://subgit.gakoy.com/auth/github?return_to=/OWNER/REPOSITORY/FOLDER.git
+```
+
+Then copy the push-URL command from the callback page, commit as usual, and run `git push`.
 
 Requested GitHub directories are cached and refreshed periodically. Their virtual history contains commits that affect the selected path, with that path removed from the checkout root.
 
