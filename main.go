@@ -271,8 +271,14 @@ func (s *Server) writeThrough(ctx context.Context, r Repository, token string) e
 	defer os.RemoveAll(work)
 	// The token is passed only to Git's HTTPS credential parser, never logged.
 	upstream := "https://x-access-token:" + url.QueryEscape(token) + "@github.com/" + strings.TrimPrefix(strings.TrimSuffix(r.Upstream, ".git"), "https://github.com/") + ".git"
-	if err := run(ctx, "git", "clone", "--depth=1", "--branch", r.Ref, upstream, work); err != nil {
+	if err := run(ctx, "git", "clone", "--depth=1", "--filter=blob:none", "--no-checkout", "--branch", r.Ref, upstream, work); err != nil {
 		return fmt.Errorf("clone upstream for write: %w", err)
+	}
+	if err := run(ctx, "git", "-C", work, "sparse-checkout", "set", "--no-cone", r.Path); err != nil {
+		return fmt.Errorf("select upstream directory for write: %w", err)
+	}
+	if err := run(ctx, "git", "-C", work, "checkout"); err != nil {
+		return fmt.Errorf("checkout upstream directory for write: %w", err)
 	}
 	destination := filepath.Join(work, filepath.FromSlash(r.Path))
 	if err := os.RemoveAll(destination); err != nil {
