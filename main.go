@@ -197,6 +197,12 @@ func (s *Server) ensure(r Repository, id string) error {
 		if status.Error == "" && time.Since(status.LastSync) < d {
 			return nil
 		}
+	} else if s.cached(r) {
+		// A restart clears in-memory status but not the materialized repository.
+		// Serve that complete cache immediately rather than making the first Git
+		// client wait for a potentially large upstream refresh.
+		s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
+		return nil
 	}
 	s.build.Lock()
 	defer s.build.Unlock()
@@ -206,6 +212,11 @@ func (s *Server) ensure(r Repository, id string) error {
 	}
 	s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
 	return nil
+}
+
+func (s *Server) cached(r Repository) bool {
+	_, err := os.Stat(filepath.Join(s.config.DataDir, "repositories", r.Name+".git", "HEAD"))
+	return err == nil
 }
 
 func run(ctx context.Context, name string, args ...string) error {

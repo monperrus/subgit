@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -43,5 +45,24 @@ func TestWriteCGIHeaders(t *testing.T) {
 	})
 	if got := w.Header().Get("Content-Type"); got != "application/x-git-upload-pack-advertisement" {
 		t.Fatalf("Content-Type = %q", got)
+	}
+}
+
+func TestEnsureUsesCachedRepositoryAfterRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	r := Repository{Name: "paper", Upstream: "https://invalid.example/paper.git", Ref: "main", Path: "paper"}
+	cache := filepath.Join(dataDir, "repositories", r.Name+".git")
+	if err := os.MkdirAll(cache, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{config: Config{DataDir: dataDir, RefreshInterval: "15m"}}
+	if err := s.ensure(r, "owner/repo/paper"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.status.Load("owner/repo/paper"); !ok {
+		t.Fatal("cached repository was not marked ready")
 	}
 }
