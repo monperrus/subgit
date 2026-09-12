@@ -337,8 +337,17 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		"REQUEST_METHOD="+r.Method, "PATH_INFO=/"+virtual.Name+".git/"+suffix, "QUERY_STRING="+r.URL.RawQuery,
 		"CONTENT_TYPE="+r.Header.Get("Content-Type"), "CONTENT_LENGTH="+r.Header.Get("Content-Length"),
 		"REMOTE_ADDR="+r.RemoteAddr, "HTTP_GIT_PROTOCOL="+r.Header.Get("Git-Protocol"))
-	var out, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if !isPush {
+		if err := streamCGI(w, cmd); err != nil {
+			log.Printf("git backend %s: %v: %s", id, err, strings.TrimSpace(stderr.String()))
+		}
+		return
+	}
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		http.Error(w, "git backend: "+strings.TrimSpace(stderr.String()), http.StatusBadGateway)
 		return
@@ -356,6 +365,38 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	writeCGI(w, out.Bytes())
 }
 
+// streamCGI forwards a CGI response without holding its body in memory. Git
+// generates clone packfiles lazily, so buffering them delays the first byte
+// until after a reverse proxy's read timeout.
+func streamCGI(w http.ResponseWriter, cmd *exec.Cmd) error {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("open git backend stdout: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start git backend: %w", err)
+	}
+
+	reader := bufio.NewReader(stdout)
+	headers, err := textproto.NewReader(reader).ReadMIMEHeader()
+	if err != nil {
+		_ = cmd.Wait()
+		return fmt.Errorf("read git backend headers: %w", err)
+	}
+	writeCGIHeaders(w, headers)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	if _, err := io.Copy(w, reader); err != nil {
+		_ = cmd.Wait()
+		return fmt.Errorf("stream git backend body: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("wait for git backend: %w", err)
+	}
+	return nil
+}
+
 func writeCGI(w http.ResponseWriter, response []byte) {
 	sep := []byte("\r\n\r\n")
 	i := bytes.Index(response, sep)
@@ -371,6 +412,11 @@ func writeCGI(w http.ResponseWriter, response []byte) {
 		http.Error(w, "invalid git backend headers", http.StatusBadGateway)
 		return
 	}
+	writeCGIHeaders(w, h)
+	_, _ = io.Copy(w, bytes.NewReader(response[i+len(sep):]))
+}
+
+func writeCGIHeaders(w http.ResponseWriter, h textproto.MIMEHeader) {
 	for key, values := range h {
 		if strings.EqualFold(key, "Status") {
 			continue
@@ -386,5 +432,4 @@ func writeCGI(w http.ResponseWriter, response []byte) {
 			w.WriteHeader(code)
 		}
 	}
-	_, _ = io.Copy(w, bytes.NewReader(response[i+len(sep):]))
 }
