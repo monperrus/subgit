@@ -138,6 +138,9 @@ func (s *Server) sync(r Repository) error {
 	if err := run(context.Background(), "git", "-C", tmp, "filter-repo", "--force", "--refs", "refs/heads/"+r.Ref, "--path", prefix, "--path-rename", prefix+":"); err != nil {
 		return fmt.Errorf("filter history: %w", err)
 	}
+	if err := keepOnlyRef(context.Background(), tmp, "refs/heads/"+r.Ref); err != nil {
+		return fmt.Errorf("prune virtual refs: %w", err)
+	}
 	if err := run(context.Background(), "git", "-C", tmp, "config", "http.receivepack", "true"); err != nil {
 		return err
 	}
@@ -158,6 +161,22 @@ func (s *Server) sync(r Repository) error {
 	}
 	_ = os.RemoveAll(old)
 	log.Printf("synced %s from %s:%s", r.Name, r.Upstream, r.Path)
+	return nil
+}
+
+func keepOnlyRef(ctx context.Context, repository, keep string) error {
+	refs, err := runOutput(ctx, "git", "-C", repository, "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return fmt.Errorf("list refs: %w", err)
+	}
+	for _, ref := range strings.Fields(string(refs)) {
+		if ref == keep {
+			continue
+		}
+		if err := run(ctx, "git", "-C", repository, "update-ref", "-d", ref); err != nil {
+			return fmt.Errorf("delete %s: %w", ref, err)
+		}
+	}
 	return nil
 }
 

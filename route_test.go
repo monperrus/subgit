@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +66,47 @@ func TestEnsureUsesCachedRepositoryAfterRestart(t *testing.T) {
 	}
 	if _, ok := s.status.Load("owner/repo/paper"); !ok {
 		t.Fatal("cached repository was not marked ready")
+	}
+}
+
+func TestKeepOnlyRef(t *testing.T) {
+	repository := t.TempDir()
+	if err := run(context.Background(), "git", "init", repository); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "config", "user.name", "Test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "config", "user.email", "test@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "paper.txt"), []byte("paper\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "add", "paper.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "commit", "-m", "paper"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "branch", "other"); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runOutput(context.Background(), "git", "-C", repository, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), "git", "-C", repository, "update-ref", "refs/tags/latest", strings.TrimSpace(string(head))); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepOnlyRef(context.Background(), filepath.Join(repository, ".git"), "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := runOutput(context.Background(), "git", "-C", repository, "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(refs)); len(got) != 1 || got[0] != "refs/heads/main" {
+		t.Fatalf("refs = %v", got)
 	}
 }
