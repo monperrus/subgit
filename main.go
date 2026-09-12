@@ -46,8 +46,9 @@ type Server struct {
 }
 
 type repoStatus struct {
-	LastSync time.Time `json:"last_sync"`
-	Error    string    `json:"error,omitempty"`
+	LastSync   time.Time `json:"last_sync"`
+	Error      string    `json:"error,omitempty"`
+	Refreshing bool      `json:"-"`
 }
 
 func main() {
@@ -213,7 +214,7 @@ func (s *Server) ensure(r Repository, id string) error {
 	if v, ok := s.status.Load(id); ok {
 		status := v.(repoStatus)
 		d, _ := time.ParseDuration(s.config.RefreshInterval)
-		if status.Error == "" && time.Since(status.LastSync) < d {
+		if status.Refreshing || (time.Since(status.LastSync) < d && (status.Error == "" || s.cached(r))) {
 			return nil
 		}
 	} else if s.cached(r) {
@@ -223,14 +224,31 @@ func (s *Server) ensure(r Repository, id string) error {
 		s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
 		return nil
 	}
-	s.build.Lock()
-	defer s.build.Unlock()
-	if err := s.sync(r); err != nil {
+	if s.cached(r) {
+		// Keep serving the last complete materialization while its expensive
+		// upstream refresh runs. Git clients must never wait for that refresh.
+		s.status.Store(id, repoStatus{LastSync: time.Now().UTC(), Refreshing: true})
+		go func() {
+			if err := s.refresh(r); err != nil {
+				s.status.Store(id, repoStatus{LastSync: time.Now().UTC(), Error: err.Error()})
+				return
+			}
+			s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
+		}()
+		return nil
+	}
+	if err := s.refresh(r); err != nil {
 		s.status.Store(id, repoStatus{Error: err.Error()})
 		return err
 	}
 	s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
 	return nil
+}
+
+func (s *Server) refresh(r Repository) error {
+	s.build.Lock()
+	defer s.build.Unlock()
+	return s.sync(r)
 }
 
 func (s *Server) cached(r Repository) bool {
@@ -324,7 +342,7 @@ func (s *Server) writeThrough(ctx context.Context, r Repository, token string) e
 	if err := run(ctx, "git", "-C", work, "push", "origin", "HEAD:refs/heads/"+r.Ref); err != nil {
 		return fmt.Errorf("push upstream projection: %w", err)
 	}
-	return s.sync(r)
+	return nil
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
