@@ -1,5 +1,7 @@
 {
   "listen": ":8080",
   "data_dir": "/data",
-  "refresh_interval": "15m"
+  "refresh_interval": "1m",
+  "refresh_wait": "30s",
+  "sync_timeout": "30m"
 }

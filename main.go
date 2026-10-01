@@ -25,10 +25,29 @@ import (
 )
 
 type Config struct {
-	Listen          string `json:"listen"`
-	DataDir         string `json:"data_dir"`
+	Listen  string `json:"listen"`
+	DataDir string `json:"data_dir"`
+	// RefreshInterval is how often known repositories are polled in the
+	// background. Correctness never depends on it: every ref advertisement
+	// is checked against the upstream head.
 	RefreshInterval string `json:"refresh_interval"`
+	// RefreshWait bounds how long a Git request waits for a rebuild after
+	// upstream moved; past it, the client gets a retryable 503, never stale refs.
+	RefreshWait string `json:"refresh_wait"`
+	// SyncTimeout bounds one materialization so a hung Git process cannot
+	// block refreshes forever.
+	SyncTimeout string `json:"sync_timeout"`
 }
+
+// upstreamFile records, inside each virtual repository, the upstream commit
+// it was materialized from. Freshness is decided by comparing it with
+// the live upstream head, not by elapsed time.
+const upstreamFile = "subgit-upstream"
+
+var (
+	errRefreshing   = errors.New("upstream moved; the virtual repository is being rebuilt, retry shortly")
+	errUnverifiable = errors.New("cannot verify freshness against upstream")
+)
 
 type Repository struct {
 	Name     string `json:"name"`
@@ -41,14 +60,25 @@ type Server struct {
 	config Config
 	oauth  *OAuth
 	mu     sync.RWMutex // excludes git-http-backend while a repo directory is replaced
-	build  sync.Mutex   // avoids concurrent materialization of the same virtual repo
+	builds sync.Map     // id -> *build; at most one materialization per virtual repo
+	known  sync.Map     // id -> Repository; polled in the background
 	status sync.Map
+	// statusMu serializes status read-modify-writes.
+	statusMu sync.Mutex
+}
+
+type build struct {
+	done chan struct{}
+	err  error
 }
 
 type repoStatus struct {
-	LastSync   time.Time `json:"last_sync"`
+	LastSync   time.Time `json:"last_sync"` // last successful materialization
+	LastCheck  time.Time `json:"last_check,omitempty"`
+	Upstream   string    `json:"upstream,omitempty"` // live upstream head at last check
+	Served     string    `json:"served,omitempty"`   // upstream commit the cache was built from
 	Error      string    `json:"error,omitempty"`
-	Refreshing bool      `json:"-"`
+	Refreshing bool      `json:"refreshing,omitempty"`
 }
 
 func main() {
@@ -61,6 +91,7 @@ func main() {
 		log.Fatal(err)
 	}
 	s := &Server{config: cfg, oauth: newOAuth()}
+	go s.poll()
 	http.HandleFunc("/status", s.handleStatus)
 	http.HandleFunc("/auth/github", s.oauth.begin)
 	http.HandleFunc("/auth/github/callback", s.oauth.callback)
@@ -89,11 +120,17 @@ func loadConfig(path string) (Config, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/data"
 	}
-	if cfg.RefreshInterval == "" {
-		cfg.RefreshInterval = "15m"
-	}
-	if _, err := time.ParseDuration(cfg.RefreshInterval); err != nil {
-		return Config{}, fmt.Errorf("invalid refresh_interval: %w", err)
+	for _, d := range []struct {
+		name  string
+		value *string
+		def   string
+	}{{"refresh_interval", &cfg.RefreshInterval, "1m"}, {"refresh_wait", &cfg.RefreshWait, "30s"}, {"sync_timeout", &cfg.SyncTimeout, "30m"}} {
+		if *d.value == "" {
+			*d.value = d.def
+		}
+		if v, err := time.ParseDuration(*d.value); err != nil || v <= 0 {
+			return Config{}, fmt.Errorf("invalid %s: %q", d.name, *d.value)
+		}
 	}
 	return cfg, os.MkdirAll(cfg.DataDir, 0755)
 }
@@ -108,7 +145,7 @@ func validateRepository(r Repository) error {
 	return nil
 }
 
-func (s *Server) sync(r Repository) error {
+func (s *Server) sync(ctx context.Context, r Repository) error {
 	root := filepath.Join(s.config.DataDir, "repositories")
 	mirror := filepath.Join(root, r.Name+".source.git")
 	target := filepath.Join(root, r.Name+".git")
@@ -116,13 +153,17 @@ func (s *Server) sync(r Repository) error {
 		return err
 	}
 	if _, err := os.Stat(mirror); os.IsNotExist(err) {
-		if err := run(context.Background(), "git", "clone", "--mirror", r.Upstream, mirror); err != nil {
+		if err := run(ctx, "git", "clone", "--mirror", r.Upstream, mirror); err != nil {
 			return fmt.Errorf("clone source: %w", err)
 		}
 	} else if err != nil {
 		return err
-	} else if err := run(context.Background(), "git", "-C", mirror, "remote", "update", "--prune"); err != nil {
+	} else if err := run(ctx, "git", "-C", mirror, "remote", "update", "--prune"); err != nil {
 		return fmt.Errorf("fetch source: %w", err)
+	}
+	source, err := runOutput(ctx, "git", "-C", mirror, "rev-parse", "refs/heads/"+r.Ref)
+	if err != nil {
+		return fmt.Errorf("read source head: %w", err)
 	}
 
 	// Build away from the live repository. --no-local prevents filter-repo from
@@ -132,17 +173,20 @@ func (s *Server) sync(r Repository) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := run(context.Background(), "git", "clone", "--mirror", "--no-local", mirror, tmp); err != nil {
+	if err := run(ctx, "git", "clone", "--mirror", "--no-local", mirror, tmp); err != nil {
 		return fmt.Errorf("copy source: %w", err)
 	}
 	prefix := strings.Trim(r.Path, "/") + "/"
-	if err := run(context.Background(), "git", "-C", tmp, "filter-repo", "--force", "--refs", "refs/heads/"+r.Ref, "--path", prefix, "--path-rename", prefix+":"); err != nil {
+	if err := run(ctx, "git", "-C", tmp, "filter-repo", "--force", "--refs", "refs/heads/"+r.Ref, "--path", prefix, "--path-rename", prefix+":"); err != nil {
 		return fmt.Errorf("filter history: %w", err)
 	}
-	if err := keepOnlyRef(context.Background(), tmp, "refs/heads/"+r.Ref); err != nil {
+	if err := keepOnlyRef(ctx, tmp, "refs/heads/"+r.Ref); err != nil {
 		return fmt.Errorf("prune virtual refs: %w", err)
 	}
-	if err := run(context.Background(), "git", "-C", tmp, "config", "http.receivepack", "true"); err != nil {
+	if err := run(ctx, "git", "-C", tmp, "config", "http.receivepack", "true"); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmp, upstreamFile), source, 0644); err != nil {
 		return err
 	}
 
@@ -161,7 +205,7 @@ func (s *Server) sync(r Repository) error {
 		return err
 	}
 	_ = os.RemoveAll(old)
-	log.Printf("synced %s from %s:%s", r.Name, r.Upstream, r.Path)
+	log.Printf("synced %s from %s:%s at %s", r.Name, r.Upstream, r.Path, strings.TrimSpace(string(source)))
 	return nil
 }
 
@@ -210,50 +254,116 @@ func repositoryForURL(path string) (Repository, string, string, error) {
 	return Repository{Name: digest, Upstream: "https://github.com/" + identifier[0] + "/" + identifier[1] + ".git", Ref: "main", Path: strings.Join(identifier[2:], "/")}, key, strings.Join(parts[gitAt+1:], "/"), nil
 }
 
-func (s *Server) ensure(r Repository, id string) error {
-	if v, ok := s.status.Load(id); ok {
-		status := v.(repoStatus)
-		d, _ := time.ParseDuration(s.config.RefreshInterval)
-		if status.Refreshing || (time.Since(status.LastSync) < d && (status.Error == "" || s.cached(r))) {
-			return nil
-		}
-	} else if s.cached(r) {
-		// A restart clears in-memory status but not the materialized repository.
-		// Serve that complete cache immediately rather than making the first Git
-		// client wait for a potentially large upstream refresh.
-		s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
+// ensure guarantees that the virtual repository reflects the current upstream
+// head before its refs are advertised. It never serves a cache that is known
+// or suspected to be stale: if upstream cannot be checked, or a rebuild does
+// not finish within refresh_wait, the request fails and the client retries.
+func (s *Server) ensure(ctx context.Context, r Repository, id string) error {
+	s.known.Store(id, r)
+	wait, _ := time.ParseDuration(s.config.RefreshWait)
+	head, err := s.upstreamHead(ctx, r)
+	if err != nil {
+		s.updateStatus(id, func(st *repoStatus) { st.LastCheck, st.Error = time.Now().UTC(), err.Error() })
+		return fmt.Errorf("%w: %v", errUnverifiable, err)
+	}
+	served := s.served(r)
+	s.updateStatus(id, func(st *repoStatus) {
+		st.LastCheck, st.Upstream, st.Served = time.Now().UTC(), head, served
+	})
+	if served == head {
 		return nil
 	}
-	if s.cached(r) {
-		// Keep serving the last complete materialization while its expensive
-		// upstream refresh runs. Git clients must never wait for that refresh.
-		s.status.Store(id, repoStatus{LastSync: time.Now().UTC(), Refreshing: true})
-		go func() {
-			if err := s.refresh(r); err != nil {
-				s.status.Store(id, repoStatus{LastSync: time.Now().UTC(), Error: err.Error()})
+	b := s.startBuild(r, id)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-b.done:
+		return b.err
+	case <-timer.C:
+		return errRefreshing
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startBuild returns the in-flight materialization of id, starting one if
+// none runs. The build outlives the request that started it.
+func (s *Server) startBuild(r Repository, id string) *build {
+	b := &build{done: make(chan struct{})}
+	if v, loaded := s.builds.LoadOrStore(id, b); loaded {
+		return v.(*build)
+	}
+	s.updateStatus(id, func(st *repoStatus) { st.Refreshing = true })
+	go func() {
+		timeout, _ := time.ParseDuration(s.config.SyncTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		b.err = s.sync(ctx, r)
+		s.updateStatus(id, func(st *repoStatus) {
+			st.Refreshing, st.Served = false, s.served(r)
+			if b.err != nil {
+				st.Error = b.err.Error()
 				return
 			}
-			s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
-		}()
-		return nil
-	}
-	if err := s.refresh(r); err != nil {
-		s.status.Store(id, repoStatus{Error: err.Error()})
-		return err
-	}
-	s.status.Store(id, repoStatus{LastSync: time.Now().UTC()})
-	return nil
+			st.LastSync, st.Error = time.Now().UTC(), ""
+		})
+		s.builds.Delete(id)
+		close(b.done)
+	}()
+	return b
 }
 
-func (s *Server) refresh(r Repository) error {
-	s.build.Lock()
-	defer s.build.Unlock()
-	return s.sync(r)
+// poll keeps known repositories warm so that Git requests rarely wait for a
+// rebuild. It is an optimization only; ensure checks upstream on every fetch.
+func (s *Server) poll() {
+	interval, _ := time.ParseDuration(s.config.RefreshInterval)
+	for range time.Tick(interval) {
+		s.known.Range(func(key, value any) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			defer cancel()
+			if err := s.ensure(ctx, value.(Repository), key.(string)); err != nil && !errors.Is(err, errRefreshing) && !errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("poll %s: %v", key, err)
+			}
+			return true
+		})
+	}
 }
 
-func (s *Server) cached(r Repository) bool {
-	_, err := os.Stat(filepath.Join(s.config.DataDir, "repositories", r.Name+".git", "HEAD"))
-	return err == nil
+func (s *Server) upstreamHead(ctx context.Context, r Repository) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	ref := "refs/heads/" + r.Ref
+	out, err := runOutput(ctx, "git", "ls-remote", r.Upstream, ref)
+	if err != nil {
+		return "", fmt.Errorf("git ls-remote %s: %w", r.Upstream, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 && fields[1] == ref {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("%s has no %s", r.Upstream, ref)
+}
+
+// served returns the upstream commit the current cache was built from, or ""
+// for a missing cache or one built before subgit recorded it.
+func (s *Server) served(r Repository) string {
+	b, err := os.ReadFile(filepath.Join(s.config.DataDir, "repositories", r.Name+".git", upstreamFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func (s *Server) updateStatus(id string, f func(*repoStatus)) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	var st repoStatus
+	if v, ok := s.status.Load(id); ok {
+		st = v.(repoStatus)
+	}
+	f(&st)
+	s.status.Store(id, st)
 }
 
 func run(ctx context.Context, name string, args ...string) error {
@@ -288,7 +398,10 @@ func (s *Server) writeThrough(ctx context.Context, r Repository, token string) e
 	}
 	defer os.RemoveAll(work)
 	// The token is passed only to Git's HTTPS credential parser, never logged.
-	upstream := "https://x-access-token:" + url.QueryEscape(token) + "@github.com/" + strings.TrimPrefix(strings.TrimSuffix(r.Upstream, ".git"), "https://github.com/") + ".git"
+	upstream := r.Upstream
+	if strings.HasPrefix(upstream, "https://github.com/") {
+		upstream = "https://x-access-token:" + url.QueryEscape(token) + "@github.com/" + strings.TrimPrefix(strings.TrimSuffix(r.Upstream, ".git"), "https://github.com/") + ".git"
+	}
 	if err := run(ctx, "git", "clone", "--depth=1", "--filter=blob:none", "--no-checkout", "--branch", r.Ref, upstream, work); err != nil {
 		return fmt.Errorf("clone upstream for write: %w", err)
 	}
@@ -324,20 +437,32 @@ func (s *Server) writeThrough(ctx context.Context, r Repository, token string) e
 	if err := run(ctx, "git", "-C", work, "add", "--", r.Path); err != nil {
 		return err
 	}
-	message, err := runOutput(ctx, "git", "-C", virtual, "log", "-1", "--format=%B", strings.TrimSpace(string(head)))
+	raw, err := runOutput(ctx, "git", "-C", virtual, "cat-file", "commit", strings.TrimSpace(string(head)))
 	if err != nil {
 		return fmt.Errorf("read pushed commit message: %w", err)
 	}
-	author, err := runOutput(ctx, "git", "-C", virtual, "log", "-1", "--format=%an <%ae>", strings.TrimSpace(string(head)))
+	_, message, _ := bytes.Cut(raw, []byte("\n\n"))
+	identity, err := runOutput(ctx, "git", "-C", virtual, "log", "-1", "--format=%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd", "--date=raw", strings.TrimSpace(string(head)))
 	if err != nil {
-		return fmt.Errorf("read pushed commit author: %w", err)
+		return fmt.Errorf("read pushed commit identity: %w", err)
+	}
+	id := strings.Split(strings.TrimSpace(string(identity)), "\x00")
+	if len(id) != 6 {
+		return fmt.Errorf("read pushed commit identity: unexpected %q", identity)
 	}
 	messageFile := filepath.Join(work, ".subgit-message")
 	if err := os.WriteFile(messageFile, message, 0600); err != nil {
 		return err
 	}
-	if err := run(ctx, "git", "-C", work, "-c", "user.name=subgit", "-c", "user.email=subgit@localhost", "commit", "--allow-empty", "--author="+strings.TrimSpace(string(author)), "-F", messageFile); err != nil {
-		return fmt.Errorf("commit upstream projection: %w", err)
+	// Reuse the pushed commit's author and committer verbatim so that the next
+	// materialization of the upstream commit reproduces the pushed commit hash
+	// instead of rewriting the pusher's history.
+	commit := exec.CommandContext(ctx, "git", "-C", work, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "--cleanup=verbatim", "-F", messageFile)
+	commit.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME="+id[0], "GIT_AUTHOR_EMAIL="+id[1], "GIT_AUTHOR_DATE="+id[2],
+		"GIT_COMMITTER_NAME="+id[3], "GIT_COMMITTER_EMAIL="+id[4], "GIT_COMMITTER_DATE="+id[5])
+	if out, err := commit.CombinedOutput(); err != nil {
+		return fmt.Errorf("commit upstream projection: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if err := run(ctx, "git", "-C", work, "push", "origin", "HEAD:refs/heads/"+r.Ref); err != nil {
 		return fmt.Errorf("push upstream projection: %w", err)
@@ -377,9 +502,18 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			oldHead = strings.TrimSpace(string(previous))
 		}
 	}
-	if err := s.ensure(virtual, id); err != nil {
-		http.Error(w, "materializing virtual repository: "+err.Error(), http.StatusBadGateway)
-		return
+	// Every clone, fetch and push starts with a ref advertisement; that is where
+	// freshness against upstream is enforced.
+	if strings.HasSuffix(suffix, "info/refs") {
+		if err := s.ensure(r.Context(), virtual, id); err != nil {
+			code := http.StatusBadGateway
+			if errors.Is(err, errRefreshing) || errors.Is(err, errUnverifiable) {
+				code = http.StatusServiceUnavailable
+				w.Header().Set("Retry-After", "10")
+			}
+			http.Error(w, "materializing virtual repository: "+err.Error(), code)
+			return
+		}
 	}
 
 	s.mu.RLock()

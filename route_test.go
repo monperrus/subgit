@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
@@ -50,22 +51,129 @@ func TestWriteCGIHeaders(t *testing.T) {
 	}
 }
 
-func TestEnsureUsesCachedRepositoryAfterRestart(t *testing.T) {
-	dataDir := t.TempDir()
-	r := Repository{Name: "paper", Upstream: "https://invalid.example/paper.git", Ref: "main", Path: "paper"}
-	cache := filepath.Join(dataDir, "repositories", r.Name+".git")
-	if err := os.MkdirAll(cache, 0755); err != nil {
+// upstream creates a local repository with a paper/ directory on main.
+func upstream(t *testing.T) string {
+	t.Helper()
+	if exec.Command("git", "filter-repo", "--version").Run() != nil {
+		t.Skip("git filter-repo not installed")
+	}
+	dir := t.TempDir()
+	git(t, dir, "init", "-b", "main")
+	git(t, dir, "config", "user.name", "Test")
+	git(t, dir, "config", "user.email", "test@example.com")
+	git(t, dir, "config", "commit.gpgsign", "false")
+	commitFile(t, dir, "paper/paper.tex", "v1\n")
+	return dir
+}
+
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := runOutput(context.Background(), "git", append([]string{"-C", dir}, args...)...)
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func commitFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cache, "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{config: Config{DataDir: dataDir, RefreshInterval: "15m"}}
-	if err := s.ensure(r, "owner/repo/paper"); err != nil {
+	git(t, dir, "add", name)
+	git(t, dir, "commit", "-m", "update "+name)
+}
+
+func testServer(t *testing.T, wait string) *Server {
+	return &Server{config: Config{DataDir: t.TempDir(), RefreshInterval: "1m", RefreshWait: wait, SyncTimeout: "1m"}}
+}
+
+func virtualFile(t *testing.T, s *Server, r Repository, name string) string {
+	t.Helper()
+	return git(t, filepath.Join(s.config.DataDir, "repositories", r.Name+".git"), "show", "refs/heads/main:"+name)
+}
+
+func TestEnsureFollowsUpstreamWithoutWaitingForInterval(t *testing.T) {
+	up := upstream(t)
+	s := testServer(t, "1m")
+	r := Repository{Name: "paper", Upstream: up, Ref: "main", Path: "paper"}
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.status.Load("owner/repo/paper"); !ok {
-		t.Fatal("cached repository was not marked ready")
+	if got := virtualFile(t, s, r, "paper.tex"); got != "v1" {
+		t.Fatalf("paper.tex = %q", got)
+	}
+	commitFile(t, up, "paper/paper.tex", "v2\n")
+	// Well within refresh_interval: the very next fetch must see v2.
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if got := virtualFile(t, s, r, "paper.tex"); got != "v2" {
+		t.Fatalf("stale virtual repository: paper.tex = %q", got)
+	}
+	if s.served(r) != git(t, up, "rev-parse", "main") {
+		t.Fatal("served head does not match upstream")
+	}
+}
+
+func TestEnsureRebuildsCacheAfterRestart(t *testing.T) {
+	up := upstream(t)
+	r := Repository{Name: "paper", Upstream: up, Ref: "main", Path: "paper"}
+	s := testServer(t, "1m")
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	commitFile(t, up, "paper/paper.tex", "v2\n")
+	restarted := &Server{config: s.config}
+	if err := restarted.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if got := virtualFile(t, restarted, r, "paper.tex"); got != "v2" {
+		t.Fatalf("restart served stale cache: paper.tex = %q", got)
+	}
+}
+
+func TestEnsureRebuildsLegacyCacheWithoutRecordedUpstream(t *testing.T) {
+	up := upstream(t)
+	r := Repository{Name: "paper", Upstream: up, Ref: "main", Path: "paper"}
+	s := testServer(t, "1m")
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.config.DataDir, "repositories", r.Name+".git", upstreamFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if s.served(r) == "" {
+		t.Fatal("legacy cache was served without being rebuilt")
+	}
+}
+
+func TestEnsureRefusesWhenUpstreamUnreachable(t *testing.T) {
+	s := testServer(t, "1m")
+	r := Repository{Name: "paper", Upstream: filepath.Join(t.TempDir(), "missing"), Ref: "main", Path: "paper"}
+	if err := s.ensure(context.Background(), r, "id"); !errors.Is(err, errUnverifiable) {
+		t.Fatalf("err = %v, want errUnverifiable", err)
+	}
+}
+
+func TestEnsureReturnsRetryableErrorWhileRebuilding(t *testing.T) {
+	up := upstream(t)
+	s := testServer(t, "1ns")
+	r := Repository{Name: "paper", Upstream: up, Ref: "main", Path: "paper"}
+	if err := s.ensure(context.Background(), r, "id"); !errors.Is(err, errRefreshing) {
+		t.Fatalf("err = %v, want errRefreshing", err)
+	}
+	if v, ok := s.builds.Load("id"); ok {
+		<-v.(*build).done
+	}
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatalf("after rebuild: %v", err)
 	}
 }
 
@@ -108,5 +216,39 @@ func TestKeepOnlyRef(t *testing.T) {
 	}
 	if got := strings.Fields(string(refs)); len(got) != 1 || got[0] != "refs/heads/main" {
 		t.Fatalf("refs = %v", got)
+	}
+}
+
+func TestWriteThroughKeepsPushedCommitHashAfterRebuild(t *testing.T) {
+	work := upstream(t)
+	up := filepath.Join(t.TempDir(), "upstream.git")
+	if err := run(context.Background(), "git", "clone", "--bare", work, up); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, "1m")
+	r := Repository{Name: "paper", Upstream: "file://" + up, Ref: "main", Path: "paper"}
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	virtual := filepath.Join(s.config.DataDir, "repositories", r.Name+".git")
+	clone := filepath.Join(t.TempDir(), "clone")
+	if err := run(context.Background(), "git", "clone", virtual, clone); err != nil {
+		t.Fatal(err)
+	}
+	git(t, clone, "config", "user.name", "Pusher")
+	git(t, clone, "config", "user.email", "pusher@example.com")
+	git(t, clone, "config", "commit.gpgsign", "false") // signed pushes cannot be reproduced
+	commitFile(t, clone, "paper.tex", "pushed\n")
+	git(t, clone, "push", "origin", "main")
+	pushed := git(t, clone, "rev-parse", "HEAD")
+
+	if err := s.writeThrough(context.Background(), r, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ensure(context.Background(), r, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, virtual, "rev-parse", "refs/heads/main"); got != pushed {
+		t.Fatalf("rebuild rewrote the pushed commit: %s != %s\n%s\n---\n%s", got, pushed, git(t, virtual, "cat-file", "commit", got), git(t, clone, "cat-file", "commit", pushed))
 	}
 }
